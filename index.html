@@ -635,8 +635,13 @@ async function callGeminiRaw(system, contents, apiKey, maxTokens){
     body: JSON.stringify(body)
   });
   const data = await res.json();
+  if(data.error){ throw new Error("Gemini error: " + (data.error.message || `HTTP ${res.status}`)); }
   const cand = data.candidates && data.candidates[0];
+  if(cand && cand.finishReason && cand.finishReason!=="STOP" && cand.finishReason!=="MAX_TOKENS"){
+    throw new Error("Gemini blocked this response (" + cand.finishReason + ") — try rephrasing.");
+  }
   const text = (cand && cand.content && cand.content.parts) ? cand.content.parts.map(p=>p.text||"").join("\n") : "";
+  if(!text) throw new Error("Gemini returned an empty response — try again.");
   return text.trim();
 }
 async function callGemini(system, input, maxTokens, apiKey){
@@ -776,6 +781,14 @@ function stopScanner(){
 }
 
 /* ================= actions ================= */
+function describeParseError(e){
+  const msg = (e && e.message) || "";
+  if(msg.includes("Gemini API key")) return msg;
+  if(msg.includes("Gemini error") || msg.includes("Gemini blocked") || msg.includes("empty response")) return msg;
+  if(msg.includes("No JSON found")) return "The AI's response wasn't readable data — try again, or rephrase more simply.";
+  if(msg.toLowerCase().includes("fetch") || msg.toLowerCase().includes("network")) return "Couldn't reach Gemini — check your internet connection and try again.";
+  return `Couldn't parse that${msg ? " (" + msg + ")" : ""} — try rephrasing, e.g. "two rotis, dal, and a bowl of curd".`;
+}
 function commitItems(items){
   const now = new Date();
   items.forEach(it=>{
@@ -794,14 +807,9 @@ async function handleAddFood(){
     const items = await parseFoodText(text);
     const cleaned = items.map(it=>({ name: it.name||"Food", quantity: it.quantity||"", calories: toNum(it.calories), protein: toNum(it.protein), carbs: toNum(it.carbs), fat: toNum(it.fat), micro: cleanMicro(it.micro) }));
     state.logInput = "";
-    if(cleaned.length > 1){
-      state.pendingItems = cleaned;
-    }else{
-      commitItems(cleaned);
-      state.addMsg = { ok:true, text: `Added ${cleaned.map(i=>i.name).join(", ")}. +${8*cleaned.length} XP` };
-    }
+    state.pendingItems = cleaned;
   }catch(e){
-    state.addMsg = { ok:false, text: e.message.includes("Gemini") ? e.message : "Couldn't parse that — try rephrasing, e.g. \"two rotis, dal, and a bowl of curd\"." };
+    state.addMsg = { ok:false, text: describeParseError(e) };
   }
   state.adding = false; render();
 }
@@ -1238,16 +1246,18 @@ function viewLog(){
   if(state.pendingItems){
     return `
     <div class="section-title" style="margin-top:0">Confirm items</div>
-    <div class="hint" style="margin-top:-4px">Remove anything that's wrong, then log the rest.</div>
-    <div class="panel">
-      ${state.pendingItems.map((it,i)=>`
-        <div class="logrow">
-          <div><div class="name">${it.name}</div><div class="meta">${it.quantity?it.quantity+' · ':''}${Math.round(it.calories)} kcal</div></div>
-          <button class="del" data-action="removePending" data-idx="${i}">Remove</button>
-        </div>`).join("")}
-    </div>
+    <div class="hint" style="margin-top:-4px">Edit anything that's off, remove what's wrong, then add the log.</div>
+    ${state.pendingItems.map((it,i)=>`
+      <div class="panel">
+        <div class="field-row">
+          <label class="field" style="flex:2"><span class="flbl">Name</span><input data-pending-field="name" data-idx="${i}" type="text" value="${escapeHtml(it.name)}"/></label>
+          <label class="field" style="flex:1"><span class="flbl">Quantity</span><input data-pending-field="quantity" data-idx="${i}" type="text" value="${escapeHtml(it.quantity)}"/></label>
+        </div>
+        <label class="field" style="margin-bottom:10px"><span class="flbl">Calories</span><input data-pending-field="calories" data-idx="${i}" type="number" value="${Math.round(it.calories)}"/></label>
+        <button class="del" data-action="removePending" data-idx="${i}">Remove this item</button>
+      </div>`).join("")}
     <div style="display:flex; gap:10px; margin-bottom:20px;">
-      <button class="primary-btn" data-action="confirmPending" style="flex:1;">Log ${state.pendingItems.length} item${state.pendingItems.length===1?'':'s'}</button>
+      <button class="primary-btn" data-action="confirmPending" style="flex:1;">Add log</button>
       <button class="ghost-btn" data-action="cancelPending">Cancel</button>
     </div>
     `;
@@ -1590,6 +1600,13 @@ function render(){
   }
   document.querySelectorAll('[data-grams-idx]').forEach(el=>{
     el.addEventListener('input', e=>{ const i = parseInt(el.dataset.gramsIdx); if(state.offResults && state.offResults[i]) state.offResults[i]._grams = e.target.value; });
+  });
+  document.querySelectorAll('[data-pending-field]').forEach(el=>{
+    el.addEventListener('input', e=>{
+      const i = parseInt(el.dataset.idx); const field = el.dataset.pendingField;
+      if(!state.pendingItems || !state.pendingItems[i]) return;
+      state.pendingItems[i][field] = field==='calories' ? toNum(e.target.value) : e.target.value;
+    });
   });
   if(state.scanning) startScanner();
   bindProfileFields();
