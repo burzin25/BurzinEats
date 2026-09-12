@@ -383,7 +383,7 @@ let state = {
   exerciseQuery:"", exerciseResults:null, exerciseSearching:false, exerciseMsg:null, selectedExercise:null, exerciseMinutes:"30",
   offBarcodeInput:"", offSearchInput:"", offResults:null, offSearching:false, offMsg:null, scanning:false,
   expandedEntry:null, settings:null, settingsDraft:null,
-  chatMessages:[], chatInput:"", chatSending:false, voiceFinal:"", voiceInterim:""
+  chatMessages:[], chatInput:"", chatSending:false, voiceFinal:"", voiceInterim:"", pendingItems:null
 };
 let ifctCache = null;
 let qrScanner = null;
@@ -663,16 +663,25 @@ async function callLLM(system, input, maxTokens){
 function extractJson(text){
   let t = text.replace(/```json|```/g,"").trim();
   const bIdx = t.indexOf('['); const oIdx = t.indexOf('{');
-  const start = bIdx===-1 ? oIdx : (oIdx===-1 ? bIdx : Math.min(bIdx,oIdx));
-  if(start>0) t = t.slice(start);
+  const isArr = bIdx!==-1 && (oIdx===-1 || bIdx<oIdx);
+  const start = isArr ? bIdx : oIdx;
+  if(start===-1) throw new Error("No JSON found in the response.");
+  const end = t.lastIndexOf(isArr ? ']' : '}');
+  t = end>start ? t.slice(start, end+1) : t.slice(start);
   return JSON.parse(t);
 }
 
 async function parseFoodText(text){
   const p = state.profile;
   const ifctRef = await buildIfctReference(text);
-  const system = `You are a nutrition estimation engine for an Indian user. The user is ${p.dietType}, from a ${p.region} background, staple diet is ${p.staple}. Meals are very often Indian dishes (dal, sabzi, roti, rice, idli, dosa, poha, paratha, biryani, paneer dishes etc) — recognize and estimate these using typical Indian home-cooking portions. Given a description of food eaten (possibly multiple items), return ONLY a valid JSON array, no markdown, no preamble. Each element: {"name": string, "quantity": string, "calories": number, "protein": number, "carbs": number, "fat": number, "micro": { one key per relevant nutrient from this list: ${NUTRIENT_LIST}, value in typical units for that nutrient, only include nutrients this food meaningfully contains } }. One object per distinct food item.${ifctRef ? "\n\n"+ifctRef : ""}`;
-  const raw = await callLLM(system, text, 1200);
+  const system = `You are a nutrition estimation engine for an Indian user. The user is ${p.dietType}, from a ${p.region} background, staple diet is ${p.staple}. Meals are very often Indian dishes (dal, sabzi, roti, rice, idli, dosa, poha, paratha, biryani, paneer dishes etc) — recognize and estimate these using typical Indian home-cooking portions.
+
+The input is often spoken aloud and transcribed, so it may be a casual rambling statement rather than a clean list — for example "so today for lunch I had like two rotis and some dal and also a glass of lassi" or "I just ate a bowl of poha with chai". Extract only the actual food and drink items mentioned; ignore filler words, meal-time mentions ("for lunch", "today"), and conversational phrasing like "I had" or "so basically".
+
+Return ONLY a valid JSON array — no markdown, no preamble, no explanation, no commentary before or after. Your entire response must be nothing but the JSON array itself. Each element: {"name": string, "quantity": string, "calories": number, "protein": number, "carbs": number, "fat": number, "micro": { one key per relevant nutrient from this list: ${NUTRIENT_LIST}, value in typical units for that nutrient, only include nutrients this food meaningfully contains } }. One object per distinct food item.
+
+Example — input: "so today for lunch I had like two rotis and some dal and also a glass of lassi" — output: [{"name":"Roti","quantity":"2 pieces","calories":140,"protein":5,"carbs":28,"fat":2,"micro":{"Iron":1.1}},{"name":"Dal","quantity":"1 bowl","calories":180,"protein":9,"carbs":22,"fat":6,"micro":{"Iron":2.5,"Folate":90}},{"name":"Lassi","quantity":"1 glass","calories":150,"protein":6,"carbs":12,"fat":8,"micro":{"Calcium":200}}]${ifctRef ? "\n\n"+ifctRef : ""}`;
+  const raw = await callLLM(system, text, 1500);
   return extractJson(raw);
 }
 
@@ -767,27 +776,48 @@ function stopScanner(){
 }
 
 /* ================= actions ================= */
+function commitItems(items){
+  const now = new Date();
+  items.forEach(it=>{
+    state.entries.push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,7), date: todayStr(), time: now.toTimeString().slice(0,5),
+      name: it.name||"Food", quantity: it.quantity||"", calories: toNum(it.calories), protein: toNum(it.protein), carbs: toNum(it.carbs), fat: toNum(it.fat), micro: cleanMicro(it.micro) });
+  });
+  saveEntries();
+  awardXp(8*items.length);
+  checkDailyBonus();
+}
 async function handleAddFood(){
   const text = state.logInput.trim();
   if(!text) return;
   state.adding = true; state.addMsg = null; render();
   try{
     const items = await parseFoodText(text);
-    const now = new Date();
-    items.forEach(it=>{
-      state.entries.push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,7), date: todayStr(), time: now.toTimeString().slice(0,5),
-        name: it.name, quantity: it.quantity||"", calories: toNum(it.calories), protein: toNum(it.protein), carbs: toNum(it.carbs), fat: toNum(it.fat), micro: cleanMicro(it.micro) });
-    });
-    await saveEntries();
-    awardXp(8*items.length);
-    checkDailyBonus();
+    const cleaned = items.map(it=>({ name: it.name||"Food", quantity: it.quantity||"", calories: toNum(it.calories), protein: toNum(it.protein), carbs: toNum(it.carbs), fat: toNum(it.fat), micro: cleanMicro(it.micro) }));
     state.logInput = "";
-    state.addMsg = { ok:true, text: `Added ${items.map(i=>i.name).join(", ")}. +${8*items.length} XP` };
+    if(cleaned.length > 1){
+      state.pendingItems = cleaned;
+    }else{
+      commitItems(cleaned);
+      state.addMsg = { ok:true, text: `Added ${cleaned.map(i=>i.name).join(", ")}. +${8*cleaned.length} XP` };
+    }
   }catch(e){
     state.addMsg = { ok:false, text: e.message.includes("Gemini") ? e.message : "Couldn't parse that — try rephrasing, e.g. \"two rotis, dal, and a bowl of curd\"." };
   }
   state.adding = false; render();
 }
+function removePendingItem(idx){
+  state.pendingItems.splice(idx,1);
+  if(state.pendingItems.length===0) state.pendingItems = null;
+  render();
+}
+function confirmPendingItems(){
+  const items = state.pendingItems;
+  commitItems(items);
+  state.addMsg = { ok:true, text: `Added ${items.map(i=>i.name).join(", ")}. +${8*items.length} XP` };
+  state.pendingItems = null;
+  render();
+}
+function cancelPendingItems(){ state.pendingItems = null; render(); }
 function deleteEntry(id){ state.entries = state.entries.filter(e=>e.id!==id); saveEntries(); render(); }
 
 let recognition = null;
@@ -1205,6 +1235,23 @@ function viewToday(){
 }
 
 function viewLog(){
+  if(state.pendingItems){
+    return `
+    <div class="section-title" style="margin-top:0">Confirm items</div>
+    <div class="hint" style="margin-top:-4px">Remove anything that's wrong, then log the rest.</div>
+    <div class="panel">
+      ${state.pendingItems.map((it,i)=>`
+        <div class="logrow">
+          <div><div class="name">${it.name}</div><div class="meta">${it.quantity?it.quantity+' · ':''}${Math.round(it.calories)} kcal</div></div>
+          <button class="del" data-action="removePending" data-idx="${i}">Remove</button>
+        </div>`).join("")}
+    </div>
+    <div style="display:flex; gap:10px; margin-bottom:20px;">
+      <button class="primary-btn" data-action="confirmPending" style="flex:1;">Log ${state.pendingItems.length} item${state.pendingItems.length===1?'':'s'}</button>
+      <button class="ghost-btn" data-action="cancelPending">Cancel</button>
+    </div>
+    `;
+  }
   return `
   <div class="section-title" style="margin-top:0">Add a meal</div>
   <div class="log-input-row">
@@ -1597,6 +1644,9 @@ document.getElementById('app').addEventListener('click', e=>{
   else if(action==='setTheme'){ setTheme(el.dataset.val); }
   else if(action==='sendChat'){ sendChatMessage(); }
   else if(action==='clearChat'){ clearChat(); }
+  else if(action==='removePending'){ removePendingItem(parseInt(el.dataset.idx)); }
+  else if(action==='confirmPending'){ confirmPendingItems(); }
+  else if(action==='cancelPending'){ cancelPendingItems(); }
   else if(action==='signIn'){ signIn(); }
   else if(action==='signOut'){ signOutUser(); }
 });
