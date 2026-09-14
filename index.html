@@ -120,6 +120,19 @@
   .listen-dot{ width:9px; height:9px; border-radius:50%; background:var(--plum); animation: blinkDot 1s infinite; }
   @keyframes blinkDot{ 0%,100%{ opacity:1; } 50%{ opacity:.25; } }
   .voice-live{ background:var(--panel-alt); border-radius:var(--radius); padding:10px 14px; font-size:13.5px; color:var(--ink); min-height:20px; max-width:320px; text-align:center; font-style:italic; }
+
+  .spinner{ width:28px; height:28px; border:3px solid var(--panel-alt); border-top-color:var(--moss); border-radius:50%; animation:spin .8s linear infinite; margin:0 auto 12px; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
+
+  .toast{ position:fixed; bottom:22px; left:50%; transform:translateX(-50%); background:var(--ink); color:var(--bg);
+    padding:12px 16px; border-radius:24px; font-size:13.5px; box-shadow:0 6px 20px rgba(0,0,0,.28); z-index:80;
+    max-width:88%; display:flex; align-items:center; gap:14px; animation:toastIn .25s ease; }
+  @keyframes toastIn{ from{ opacity:0; transform:translateX(-50%) translateY(8px); } to{ opacity:1; transform:translateX(-50%) translateY(0); } }
+  .toast button{ background:none; border:none; color:var(--moss-light); font-weight:700; font-size:13px; cursor:pointer; flex-shrink:0; }
+
+  nav.navicons{ position:relative; }
+  nav.navicons::after{ content:""; position:absolute; top:0; right:0; bottom:0; width:28px; pointer-events:none;
+    background:linear-gradient(to right, rgba(0,0,0,0), var(--bg)); }
   .primary-btn{ background:var(--moss); color:white; border:none; border-radius:var(--radius); padding:13px 18px; font-family:'Work Sans', sans-serif; font-size:14px; font-weight:600; cursor:pointer; }
   .primary-btn:disabled{ opacity:.5; cursor:default; }
   .ghost-btn{ background:none; border:1px solid var(--line); border-radius:var(--radius); padding:10px 14px; font-size:13px; cursor:pointer; color:var(--ink); }
@@ -383,8 +396,16 @@ let state = {
   exerciseQuery:"", exerciseResults:null, exerciseSearching:false, exerciseMsg:null, selectedExercise:null, exerciseMinutes:"30",
   offBarcodeInput:"", offSearchInput:"", offResults:null, offSearching:false, offMsg:null, scanning:false,
   expandedEntry:null, settings:null, settingsDraft:null,
-  chatMessages:[], chatInput:"", chatSending:false, voiceFinal:"", voiceInterim:"", pendingItems:null
+  chatMessages:[], chatInput:"", chatSending:false, voiceFinal:"", voiceInterim:"", pendingItems:null, toast:null
 };
+let toastTimer = null;
+function showToast(text, opts){
+  opts = opts || {};
+  if(toastTimer) clearTimeout(toastTimer);
+  state.toast = { text, actionLabel: opts.actionLabel, onAction: opts.onAction };
+  render();
+  toastTimer = setTimeout(()=>{ state.toast = null; render(); }, opts.ms || 4500);
+}
 let ifctCache = null;
 let qrScanner = null;
 let scannerStarting = false;
@@ -665,7 +686,9 @@ async function callLLM(system, input, maxTokens){
   if(!key) throw new Error("Add a free Gemini API key in Profile → AI settings to use this feature.");
   return await callGemini(system, input, maxTokens, key);
 }
+let lastParseWasTruncated = false;
 function extractJson(text){
+  lastParseWasTruncated = false;
   let t = text.replace(/```json|```/g,"").trim();
   const bIdx = t.indexOf('['); const oIdx = t.indexOf('{');
   const isArr = bIdx!==-1 && (oIdx===-1 || bIdx<oIdx);
@@ -673,7 +696,21 @@ function extractJson(text){
   if(start===-1) throw new Error("No JSON found in the response.");
   const end = t.lastIndexOf(isArr ? ']' : '}');
   t = end>start ? t.slice(start, end+1) : t.slice(start);
-  return JSON.parse(t);
+  try{
+    return JSON.parse(t);
+  }catch(parseErr){
+    if(isArr){
+      const repaired = repairTruncatedArray(t);
+      if(repaired && repaired.length){ lastParseWasTruncated = true; return repaired; }
+    }
+    throw parseErr;
+  }
+}
+function repairTruncatedArray(t){
+  for(let i = t.lastIndexOf('}'); i > 0; i = t.lastIndexOf('}', i-1)){
+    try{ return JSON.parse(t.slice(0, i+1) + "]"); }catch(e){ /* try an earlier closing point */ }
+  }
+  return null;
 }
 
 async function parseFoodText(text){
@@ -686,7 +723,7 @@ The input is often spoken aloud and transcribed, so it may be a casual rambling 
 Return ONLY a valid JSON array — no markdown, no preamble, no explanation, no commentary before or after. Your entire response must be nothing but the JSON array itself. Each element: {"name": string, "quantity": string, "calories": number, "protein": number, "carbs": number, "fat": number, "micro": { one key per relevant nutrient from this list: ${NUTRIENT_LIST}, value in typical units for that nutrient, only include nutrients this food meaningfully contains } }. One object per distinct food item.
 
 Example — input: "so today for lunch I had like two rotis and some dal and also a glass of lassi" — output: [{"name":"Roti","quantity":"2 pieces","calories":140,"protein":5,"carbs":28,"fat":2,"micro":{"Iron":1.1}},{"name":"Dal","quantity":"1 bowl","calories":180,"protein":9,"carbs":22,"fat":6,"micro":{"Iron":2.5,"Folate":90}},{"name":"Lassi","quantity":"1 glass","calories":150,"protein":6,"carbs":12,"fat":8,"micro":{"Calcium":200}}]${ifctRef ? "\n\n"+ifctRef : ""}`;
-  const raw = await callLLM(system, text, 1500);
+  const raw = await callLLM(system, text, 3000);
   return extractJson(raw);
 }
 
@@ -805,9 +842,11 @@ async function handleAddFood(){
   state.adding = true; state.addMsg = null; render();
   try{
     const items = await parseFoodText(text);
+    const wasTruncated = lastParseWasTruncated;
     const cleaned = items.map(it=>({ name: it.name||"Food", quantity: it.quantity||"", calories: toNum(it.calories), protein: toNum(it.protein), carbs: toNum(it.carbs), fat: toNum(it.fat), micro: cleanMicro(it.micro) }));
     state.logInput = "";
     state.pendingItems = cleaned;
+    if(wasTruncated) state.addMsg = { ok:false, text:"The response got cut off partway through — these items look right, but check nothing you mentioned is missing before adding." };
   }catch(e){
     state.addMsg = { ok:false, text: describeParseError(e) };
   }
@@ -821,12 +860,19 @@ function removePendingItem(idx){
 function confirmPendingItems(){
   const items = state.pendingItems;
   commitItems(items);
-  state.addMsg = { ok:true, text: `Added ${items.map(i=>i.name).join(", ")}. +${8*items.length} XP` };
-  state.pendingItems = null;
+  state.pendingItems = null; state.addMsg = null;
+  showToast(`Added ${items.map(i=>i.name).join(", ")} · +${8*items.length} XP`);
   render();
 }
-function cancelPendingItems(){ state.pendingItems = null; render(); }
-function deleteEntry(id){ state.entries = state.entries.filter(e=>e.id!==id); saveEntries(); render(); }
+function cancelPendingItems(){ state.pendingItems = null; state.addMsg = null; render(); }
+function deleteEntry(id){
+  const idx = state.entries.findIndex(e=>e.id===id);
+  if(idx===-1) return;
+  const removed = state.entries[idx];
+  state.entries.splice(idx,1); saveEntries();
+  showToast(`Removed ${removed.name}`, { actionLabel:"Undo", onAction:()=>{ state.entries.splice(idx,0,removed); saveEntries(); render(); } });
+  render();
+}
 
 let recognition = null;
 let silenceTimer = null;
@@ -892,6 +938,14 @@ function addWater(ml){
   state.water.push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,6), date: todayStr(), time:new Date().toTimeString().slice(0,5), ml });
   saveWater(); awardXp(5); checkDailyBonus(); render();
 }
+function deleteWater(id){
+  const idx = state.water.findIndex(w=>w.id===id);
+  if(idx===-1) return;
+  const removed = state.water[idx];
+  state.water.splice(idx,1); saveWater();
+  showToast(`Removed ${removed.ml}ml`, { actionLabel:"Undo", onAction:()=>{ state.water.splice(idx,0,removed); saveWater(); render(); } });
+  render();
+}
 function addCustomWater(){
   const ml = parseInt(state.customWaterMl);
   if(!ml || ml<=0) return;
@@ -906,7 +960,14 @@ function handleAddBurn(){
   if(!kcal || kcal<=0) return;
   addBurned(kcal, 'manual'); state.burnInputVal = "";
 }
-function deleteBurned(id){ state.burned = state.burned.filter(b=>b.id!==id); saveBurned(); render(); }
+function deleteBurned(id){
+  const idx = state.burned.findIndex(b=>b.id===id);
+  if(idx===-1) return;
+  const removed = state.burned[idx];
+  state.burned.splice(idx,1); saveBurned();
+  showToast(`Removed ${removed.kcal} kcal burned`, { actionLabel:"Undo", onAction:()=>{ state.burned.splice(idx,0,removed); saveBurned(); render(); } });
+  render();
+}
 
 /* ---- Apple Health import ---- */
 async function readFileAsText(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=()=>rej(new Error("read failed")); r.readAsText(file); }); }
@@ -993,8 +1054,10 @@ function logExerciseWorkout(){
   const weight = state.profile.weightKg || 65;
   const kcal = Math.round(met*3.5*weight/200*minutes);
   state.burned.push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,6), date: todayStr(), time:new Date().toTimeString().slice(0,5), kcal, source:'manual', name: state.selectedExercise.name });
+  const exName = state.selectedExercise.name;
   saveBurned(); awardXp(8); checkDailyBonus();
   state.selectedExercise = null; state.exerciseResults = null; state.exerciseQuery = "";
+  showToast(`Logged ${exName} · ${kcal} kcal burned · +8 XP`);
   render();
 }
 
@@ -1047,7 +1110,9 @@ function addOffProductToLog(idx){
   state.entries.push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,7), date: todayStr(), time:new Date().toTimeString().slice(0,5), ...entryBase });
   saveEntries(); awardXp(8); checkDailyBonus();
   state.offResults = null; state.offBarcodeInput = ""; state.offSearchInput = "";
-  state.tab = "today"; render();
+  state.tab = "today";
+  showToast(`Added ${entryBase.name} · +8 XP`);
+  render();
 }
 
 async function handleGetSuggestions(){
@@ -1059,7 +1124,9 @@ async function handleGetSuggestions(){
 function addSuggestionToLog(s){
   state.entries.push({ id: Date.now()+"-"+Math.random().toString(36).slice(2,7), date: todayStr(), time: new Date().toTimeString().slice(0,5),
     name: s.food, quantity:"", calories: toNum(s.calories), protein: toNum(s.protein), carbs: toNum(s.carbs), fat: toNum(s.fat), micro: cleanMicro(s.micro) });
-  saveEntries(); awardXp(8); checkDailyBonus(); state.tab = "today"; render();
+  saveEntries(); awardXp(8); checkDailyBonus(); state.tab = "today";
+  showToast(`Added ${s.food} · +8 XP`);
+  render();
 }
 
 function saveProfileDraft(){
@@ -1247,6 +1314,7 @@ function viewLog(){
     return `
     <div class="section-title" style="margin-top:0">Confirm items</div>
     <div class="hint" style="margin-top:-4px">Edit anything that's off, remove what's wrong, then add the log.</div>
+    ${state.addMsg ? `<div class="status-msg ${state.addMsg.ok?'':'err'}">${state.addMsg.text}</div>` : ""}
     ${state.pendingItems.map((it,i)=>`
       <div class="panel">
         <div class="field-row">
@@ -1336,7 +1404,7 @@ function viewWater(){
   <div class="streakcard"><div class="streakbox"><div class="snum">${waterStreak()}</div><div class="slbl">days hitting your goal</div></div></div>
   <div class="section-title">Today's log</div>
   ${todaysWater().length===0 ? `<div class="empty"><span class="serif">No water logged yet</span></div>` :
-  `<div class="panel">${todaysWater().slice().reverse().map(w=>`<div class="logrow"><div class="name">${w.ml}ml</div><div class="meta">${w.time}</div></div>`).join("")}</div>`}
+  `<div class="panel">${todaysWater().slice().reverse().map(w=>`<div class="logrow"><div><div class="name">${w.ml}ml</div><div class="meta">${w.time}</div></div><button class="del" data-action="delWater" data-id="${w.id}">Remove</button></div>`).join("")}</div>`}
   `;
 }
 
@@ -1526,7 +1594,7 @@ function render(){
     app.innerHTML = `<header class="top"><div><div class="brand">Burzin<span>Eats</span></div></div></header>${viewSignIn()}`;
     return;
   }
-  if(!state.loaded){ app.innerHTML = `<div class="empty">Loading…</div>`; return; }
+  if(!state.loaded){ app.innerHTML = `<div class="empty"><div class="spinner"></div>Loading your data…</div>`; return; }
 
   let body = "";
   if(state.tab==="today") body = viewToday();
@@ -1555,6 +1623,7 @@ function render(){
     </header>
     ${nav}
     <main>${body}</main>
+    ${state.toast ? `<div class="toast">${escapeHtml(state.toast.text)}${state.toast.actionLabel ? `<button data-action="toastAction">${state.toast.actionLabel}</button>` : ""}</div>` : ""}
   `;
 
   if(document.getElementById('logInputBox')){
@@ -1635,6 +1704,8 @@ document.getElementById('app').addEventListener('click', e=>{
   else if(action==='add'){ handleAddFood(); }
   else if(action==='voice'){ toggleVoice(); }
   else if(action==='del'){ deleteEntry(el.dataset.id); }
+  else if(action==='delWater'){ deleteWater(el.dataset.id); }
+  else if(action==='toastAction'){ if(state.toast && state.toast.onAction) state.toast.onAction(); state.toast = null; if(toastTimer) clearTimeout(toastTimer); render(); }
   else if(action==='toggleEntry'){ state.expandedEntry = (state.expandedEntry===el.dataset.id) ? null : el.dataset.id; render(); }
   else if(action==='suggest'){ handleGetSuggestions(); }
   else if(action==='addSuggestion'){ addSuggestionToLog(state.suggestions[parseInt(el.dataset.idx)]); }
