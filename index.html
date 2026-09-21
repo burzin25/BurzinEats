@@ -154,6 +154,8 @@
   .chiprow{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:18px; }
   .chip{ padding:8px 13px; border:1px solid var(--line); border-radius:20px; font-size:13px; cursor:pointer; background:var(--panel); user-select:none; }
   .chip.on{ background:var(--moss); color:white; border-color:var(--moss); }
+  .fab-log{ position:fixed; right:18px; bottom:24px; width:56px; height:56px; border-radius:50%; background:var(--moss); color:white; border:none; box-shadow:0 6px 18px rgba(0,0,0,0.28); display:flex; align-items:center; justify-content:center; cursor:pointer; z-index:40; }
+  .fab-log:active{ transform:scale(0.94); }
 
   .suggestion-card{ border:1px solid var(--line); border-radius:var(--radius); padding:16px; margin-bottom:12px; background:var(--panel); }
   .suggestion-card .sname{ font-family:'Fraunces',serif; font-size:17px; font-weight:500; margin-bottom:4px; }
@@ -401,9 +403,11 @@ let state = {
   exerciseQuery:"", exerciseResults:null, exerciseSearching:false, exerciseMsg:null, selectedExercise:null, exerciseMinutes:"30",
   offBarcodeInput:"", offSearchInput:"", offResults:null, offSearching:false, offMsg:null, scanning:false,
   expandedEntry:null, settings:null, settingsDraft:null,
-  chatMessages:[], chatInput:"", chatSending:false, voiceFinal:"", voiceInterim:"", pendingItems:null, toast:null
+  chatMessages:[], chatInput:"", chatSending:false, voiceFinal:"", voiceInterim:"", pendingItems:null, toast:null,
+  focusLogInput:false
 };
 let toastTimer = null;
+let lastFavorites = [];
 function showToast(text, opts){
   opts = opts || {};
   if(toastTimer) clearTimeout(toastTimer);
@@ -897,6 +901,30 @@ function commitItems(items){
   saveEntries();
   awardXp(8*items.length);
   checkDailyBonus();
+}
+function recentFavorites(limit){
+  limit = limit || 6;
+  const byName = {};
+  state.entries.forEach(e=>{
+    const key = (e.name||"").trim().toLowerCase();
+    if(!key) return;
+    const ts = parseInt(e.id) || 0;
+    if(!byName[key]) byName[key] = { count:0, lastTs:-1, sample:null };
+    byName[key].count++;
+    if(ts >= byName[key].lastTs){ byName[key].lastTs = ts; byName[key].sample = e; }
+  });
+  return Object.values(byName)
+    .sort((a,b)=> (b.count - a.count) || (b.lastTs - a.lastTs))
+    .slice(0, limit)
+    .map(v=>v.sample);
+}
+function quickAddFavorite(idx){
+  const fav = lastFavorites[idx];
+  if(!fav) return;
+  const item = { name: fav.name||"Food", quantity: fav.quantity||"", calories: toNum(fav.calories), protein: toNum(fav.protein), carbs: toNum(fav.carbs), fat: toNum(fav.fat), micro: cleanMicro(fav.micro) };
+  commitItems([item]);
+  showToast(`Added ${item.name} · +8 XP`);
+  render();
 }
 function extractQtyNumber(str){
   if(!str) return null;
@@ -1414,8 +1442,13 @@ function viewLog(){
     </div>
     `;
   }
+  lastFavorites = recentFavorites(6);
   return `
   <div class="section-title" style="margin-top:0">Add a meal</div>
+  ${lastFavorites.length ? `
+  <div class="chiprow" style="margin-bottom:12px;">
+    ${lastFavorites.map((f,i)=>`<div class="chip" data-action="quickFav" data-idx="${i}" title="Add ${escapeHtml(f.name)} again, ${Math.round(f.calories)} kcal">${escapeHtml(f.name)}</div>`).join("")}
+  </div>` : ``}
   <div class="input-mic-wrap">
     <input id="logInputBox" type="text" placeholder="Type or tap the mic to say what you ate" value="${state.logInput.replace(/"/g,'&quot;')}"/>
     <button class="mic-inline ${state.listening?'mic-on':''}" data-action="voice" title="Voice input">
@@ -1700,12 +1733,22 @@ function render(){
     </header>
     ${nav}
     <main>${body}</main>
+    ${(state.profile.onboarded && state.tab!=='log' && state.tab!=='signin') ? `
+    <button class="fab-log" data-action="quickLogFab" title="Quick log">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.4" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+    </button>` : ""}
     ${state.toast ? `<div class="toast">${escapeHtml(state.toast.text)}${state.toast.actionLabel ? `<button data-action="toastAction">${state.toast.actionLabel}</button>` : ""}</div>` : ""}
   `;
 
   if(document.getElementById('logInputBox')){
-    document.getElementById('logInputBox').addEventListener('input', e=>{ state.logInput = e.target.value; });
-    document.getElementById('logInputBox').addEventListener('keydown', e=>{ if(e.key==='Enter') handleAddFood(); });
+    const logInputEl = document.getElementById('logInputBox');
+    logInputEl.addEventListener('input', e=>{ state.logInput = e.target.value; });
+    logInputEl.addEventListener('keydown', e=>{ if(e.key==='Enter') handleAddFood(); });
+    if(state.focusLogInput){
+      state.focusLogInput = false;
+      logInputEl.focus();
+      const v = logInputEl.value; logInputEl.value = ""; logInputEl.value = v;
+    }
   }
   if(document.getElementById('customWaterInput')){
     document.getElementById('customWaterInput').addEventListener('input', e=>{ state.customWaterMl = e.target.value; });
@@ -1802,7 +1845,9 @@ document.getElementById('app').addEventListener('click', e=>{
   const el = e.target.closest('[data-action]');
   if(!el) return;
   const action = el.dataset.action;
-  if(action==='tab'){ if(state.scanning) stopScanner(); state.tab = el.dataset.val; state.addMsg=null; render(); }
+  if(action==='tab'){ if(state.scanning) stopScanner(); state.tab = el.dataset.val; state.addMsg=null; if(el.dataset.val==='log') state.focusLogInput = true; render(); }
+  else if(action==='quickLogFab'){ if(state.scanning) stopScanner(); state.tab = 'log'; state.addMsg = null; state.focusLogInput = true; render(); }
+  else if(action==='quickFav'){ quickAddFavorite(parseInt(el.dataset.idx)); }
   else if(action==='add'){ handleAddFood(); }
   else if(action==='voice'){ toggleVoice(); }
   else if(action==='del'){ deleteEntry(el.dataset.id); }
